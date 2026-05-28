@@ -1,0 +1,52 @@
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local configuration
+config.txt
+token.txt
+.env
+.env.*
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+ozon_cookies.json
+cookies.json
+cart_items.json
+browser_data/
+
+# Local debug artifacts
+test_cookies_selenium
+response_api.json
+response_page.html
+resp_api.json
+api_unexpected_response.html
+ozon_page.png
+
+# IDE and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
