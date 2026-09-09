@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
@@ -16,7 +17,14 @@ from price_checker import extract_product_id, resolve_short_url
 logger = logging.getLogger(__name__)
 
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), "ozon_cookies.json")
+BROWSER_PROFILE_DIR = os.path.abspath(
+    os.getenv(
+        "OZON_BROWSER_PROFILE_DIR",
+        os.path.join(os.path.dirname(__file__), ".ozon-browser-profile"),
+    )
+)
 COOKIE_TTL_HOURS = 11
+_PLAYWRIGHT_PROFILE_LOCK = asyncio.Lock()
 
 class OzonClient:
     def __init__(self):
@@ -163,60 +171,92 @@ class OzonClient:
             return False
 
     async def _solve_captcha_playwright(self, page_url: str = "https://www.ozon.ru/") -> bool:
+        _, _, _, cookies_received = await self._get_product_price_playwright(page_url)
+        return cookies_received
+
+    async def _get_product_price_playwright(
+        self,
+        page_url: str,
+    ) -> Tuple[Optional[str], Optional[float], Optional[float], bool]:
+        """
+        Открывает страницу в Playwright и читает цену из карточки товара.
+
+        Последний элемент результата показывает, были ли получены cookies. Если
+        цены в DOM нет, эти cookies можно использовать для одного JSON retry.
+        """
         logger.info("Запуск Playwright для решения капчи...")
         from playwright.async_api import async_playwright
 
         cookies_dict = {}
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            context = await browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                locale="ru-RU",
-                timezone_id="Europe/Moscow",
-            )
-            page = await context.new_page()
+        name = None
+        regular_price = None
+        ozon_bank_price = None
 
-            test_url = "https://www.ozon.ru/"
-            logger.info(f"Открываю {test_url}...")
-            await page.goto(test_url, wait_until="domcontentloaded", timeout=30000)
-
-            logger.info("Жду решения капчи (до 60 сек)...")
-            for i in range(60, 0, -1):
-                try:
-                    title = await page.title()
-                except Exception:
-                    await asyncio.sleep(1)
-                    continue
-
-                if "Antibot" not in title and "ограничен" not in title:
-                    logger.info(f"Капча решена! Заголовок: {title[:60]}")
-                    break
-                if i % 10 == 0:
-                    logger.info(f"  осталось {i} сек...")
-                await asyncio.sleep(1)
-            else:
-                logger.error("Капча не решена за 60 секунд")
-                await browser.close()
-                return False
-
+        async with _PLAYWRIGHT_PROFILE_LOCK:
             try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
-            await asyncio.sleep(5)
+                async with async_playwright() as p:
+                    context = await p.chromium.launch_persistent_context(
+                        user_data_dir=BROWSER_PROFILE_DIR,
+                        headless=False,
+                        args=["--disable-blink-features=AutomationControlled"],
+                        viewport={"width": 1920, "height": 1080},
+                        locale="ru-RU",
+                        timezone_id="Europe/Moscow",
+                    )
+                    try:
+                        page = context.pages[0] if context.pages else await context.new_page()
 
-            cookies = await context.cookies()
-            cookies_dict = {c["name"]: c["value"] for c in cookies}
-            logger.info(f"Получено {len(cookies_dict)} cookies")
-            await browser.close()
+                        logger.info(f"Открываю {page_url}...")
+                        await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
 
-        self._cookies = cookies_dict
-        self._cookies_loaded_at = datetime.now()
-        self._save_cookies_to_file()
-        return True
+                        logger.info("Жду решения капчи (до 60 сек)...")
+                        for i in range(60, 0, -1):
+                            try:
+                                title = await page.title()
+                            except Exception:
+                                await asyncio.sleep(1)
+                                continue
+
+                            if "antibot" not in title.lower() and "ограничен" not in title.lower():
+                                logger.info(f"Капча решена! Заголовок: {title[:60]}")
+                                break
+                            if i % 10 == 0:
+                                logger.info(f"  осталось {i} сек...")
+                            await asyncio.sleep(1)
+                        else:
+                            logger.error("Капча не решена за 60 секунд")
+                            return None, None, None, False
+
+                        is_product_page = self._extract_product_id_from_page_url(page_url) is not None
+                        if is_product_page:
+                            try:
+                                await page.wait_for_selector("[data-widget='webPrice']", timeout=15000)
+                            except Exception:
+                                logger.warning("Playwright: виджет цены не появился за 15 секунд")
+                        await asyncio.sleep(2.5)
+
+                        if is_product_page:
+                            name = await self._extract_product_name_from_page(page)
+                            regular_price, ozon_bank_price = await self._extract_prices_from_page(page)
+
+                        cookies = await context.cookies()
+                        cookies_dict = {c["name"]: c["value"] for c in cookies}
+                        logger.info(f"Получено {len(cookies_dict)} cookies")
+                    finally:
+                        await context.close()
+            except Exception as e:
+                logger.error(f"Playwright: ошибка при загрузке страницы товара — {e}")
+                return None, None, None, False
+
+        if cookies_dict:
+            self._cookies = cookies_dict
+            self._cookies_loaded_at = datetime.now()
+            self._save_cookies_to_file()
+        logger.info(
+            f"Playwright: результат карточки: {name or 'без названия'}, "
+            f"обычная={regular_price}, Ozon Банк={ozon_bank_price}"
+        )
+        return name, regular_price, ozon_bank_price, bool(cookies_dict)
 
     def _build_api_url(self, product_url: str) -> Optional[str]:
         if "ozon.ru/" not in product_url:
@@ -258,8 +298,6 @@ class OzonClient:
         )
 
     def _parse_price_text(self, text: str) -> Optional[float]:
-        import re
-
         if not text:
             return None
         digits_only = re.sub(r"\D", "", text)
@@ -267,6 +305,123 @@ class OzonClient:
             return None
         value = int(digits_only)
         return float(value) if value > 0 else None
+
+    def _parse_prices_from_widget_text(
+        self,
+        text: str,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Возвращает (обычная цена, цена Ozon Банка) из текста webPrice."""
+        if not text:
+            return None, None
+
+        money_pattern = re.compile(
+            r"(?<!\d)(\d{1,3}(?:[ \u00a0\u2009\u202f]\d{3})*(?:[,.]\d{1,2})?)\s*₽"
+        )
+        card_label_pattern = re.compile(
+            r"(?:с|по)\s+ozon\s+карт(?:ой|е)|ozon\s+банк|с\s+банками",
+            re.IGNORECASE,
+        )
+        regular_label_pattern = re.compile(
+            r"без\s+ozon\s+карт(?:ы|ой)|обычная|с\s+другими\s+банками",
+            re.IGNORECASE,
+        )
+
+        prices = [
+            (match.start(), match.end(), self._parse_price_text(match.group(1)))
+            for match in money_pattern.finditer(text)
+        ]
+        prices = [price for price in prices if price[2] is not None]
+        if not prices:
+            return None, None
+
+        labels = [
+            (match.start(), match.end(), "card")
+            for match in card_label_pattern.finditer(text)
+        ] + [
+            (match.start(), match.end(), "regular")
+            for match in regular_label_pattern.finditer(text)
+        ]
+        labels.sort(key=lambda label: label[0])
+
+        regular_price = None
+        ozon_bank_price = None
+        previous_label_end = 0
+        for label_start, label_end, price_kind in labels:
+            block_prices = [
+                price[2]
+                for price in prices
+                if previous_label_end <= price[0] and price[1] <= label_start
+            ]
+            if block_prices:
+                # Ozon places the current price first and a crossed-out old price
+                # after it inside the same payment-method block.
+                if price_kind == "card" and ozon_bank_price is None:
+                    ozon_bank_price = block_prices[0]
+                elif price_kind == "regular" and regular_price is None:
+                    regular_price = block_prices[0]
+            previous_label_end = label_end
+
+        distinct_prices = list(dict.fromkeys(price[2] for price in prices))
+        if ozon_bank_price is not None and regular_price is None:
+            regular_price = next(
+                (
+                    price[2]
+                    for price in prices
+                    if price[0] >= previous_label_end and price[2] != ozon_bank_price
+                ),
+                None,
+            )
+        elif regular_price is None and ozon_bank_price is None:
+            regular_price = distinct_prices[0]
+
+        return regular_price, ozon_bank_price
+
+    async def _extract_product_name_from_page(self, page) -> Optional[str]:
+        for selector, attribute in (
+            ("h1", None),
+            ("meta[property='og:title']", "content"),
+        ):
+            locator = page.locator(selector)
+            if await locator.count() == 0:
+                continue
+            try:
+                value = (
+                    await locator.first.get_attribute(attribute)
+                    if attribute
+                    else await locator.first.inner_text()
+                )
+            except Exception:
+                continue
+            if value and value.strip():
+                return value.strip()
+        return None
+
+    async def _extract_prices_from_page(
+        self,
+        page,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        widget = page.locator("[data-widget='webPrice']")
+        if await widget.count() > 0:
+            try:
+                widget_text = await widget.first.inner_text()
+                regular_price, ozon_bank_price = self._parse_prices_from_widget_text(widget_text)
+                if regular_price is not None or ozon_bank_price is not None:
+                    return regular_price, ozon_bank_price
+            except Exception as e:
+                logger.warning(f"Playwright: не удалось прочитать webPrice — {e}")
+
+        for selector in ("meta[property='product:price:amount']", "meta[itemprop='price']"):
+            locator = page.locator(selector)
+            if await locator.count() == 0:
+                continue
+            try:
+                regular_price = self._parse_price_text(await locator.first.get_attribute("content"))
+            except Exception:
+                continue
+            if regular_price is not None:
+                return regular_price, None
+
+        return None, None
 
     def _fix_mojibake_text(self, text: Optional[str]) -> Optional[str]:
         if not text or not isinstance(text, str):
@@ -402,22 +557,27 @@ class OzonClient:
         Получение цены через JSON endpoint Ozon.
         На вход принимает обычный product URL, а внутри преобразует его в endpoint `...page/json/v2?url=...`.
         """
-        if self._cookies_expired():
-            logger.info("JSON-режим: cookies истекли, запускаю эмуляцию браузера...")
-            if not await self._solve_captcha(url):
-                return None, None, None, False
+        json_retries = min(max_retries, 1)
+        playwright_attempted = False
 
-        for attempt in range(max_retries + 1):
+        for attempt in range(json_retries + 1):
             status, body = self._make_request(url)
             logger.info(f"JSON-запрос к Ozon: статус {status}, размер {len(body)} байт")
 
             if self._is_captcha_response(status, body):
-                logger.warning(f"JSON-метод наткнулся на капчу, попытка {attempt + 1}/{max_retries + 1}")
-                if attempt < max_retries:
-                    logger.warning("Перехожу к эмуляции браузера: сначала Selenium, затем Playwright при неудаче")
-                    if not await self._solve_captcha(url):
-                        return None, None, None, False
-                    continue
+                logger.warning(f"JSON-метод наткнулся на капчу, попытка {attempt + 1}/{json_retries + 1}")
+                if not playwright_attempted:
+                    playwright_attempted = True
+                    logger.warning("Запускаю Playwright fallback на странице товара")
+                    name, regular_price, ozon_bank_price, cookies_received = (
+                        await self._get_product_price_playwright(url)
+                    )
+                    if regular_price is not None or ozon_bank_price is not None:
+                        return name, regular_price, ozon_bank_price, True
+                    if cookies_received and attempt < json_retries:
+                        logger.info("Цена в DOM не найдена, повторяю JSON-запрос с новыми cookies")
+                        continue
+
                 logger.error("Не удалось пройти капчу JSON-методом")
                 return None, None, None, False
 
@@ -465,4 +625,3 @@ client = OzonClient()
 
 async def get_ozon_price(url: str) -> Tuple[Optional[str], Optional[float], Optional[float], bool]:
     return await client.get_product_price(url)
-

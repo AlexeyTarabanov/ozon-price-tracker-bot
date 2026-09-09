@@ -86,6 +86,69 @@ def to_msk(dt_str: str) -> str:
         return dt_str
 
 
+def _format_msk(dt_str: str, date_only: bool = False) -> str:
+    if not dt_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(dt_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(MSK_TZ)
+        return dt.strftime('%d.%m.%Y' if date_only else '%d.%m.%Y %H:%M')
+    except Exception:
+        return dt_str
+
+
+def _format_price(value) -> str:
+    return f"{value:,.0f}".replace(",", " ") + " ₽" if value is not None else "—"
+
+
+def _format_signed(value, decimals=0) -> str:
+    sign = "+" if value > 0 else ("−" if value < 0 else "")
+    number = f"{abs(value):,.{decimals}f}".replace(",", " ")
+    return f"{sign}{number}"
+
+
+def build_product_tracking_text(product, user_id: int) -> str:
+    """Сформировать пользовательскую сводку цены для Telegram."""
+    product_id = product['product_id']
+    name = product['product_name'] or f"Товар #{product_id}"
+    summary = db.get_user_price_summary(user_id, product_id)
+    if not summary:
+        return f"📦 *{name}*\n\nДанные отслеживания недоступны"
+
+    lines = [
+        f"📦 *{name}*",
+        "",
+        f"Старт: {_format_price(summary['start_price'])} · "
+        f"{_format_msk(summary['started_at'], date_only=True)}",
+        f"Сейчас: {_format_price(summary['current_price'])} · "
+        f"{_format_msk(summary['last_checked'])}",
+    ]
+    if (
+        summary['ozon_bank_price'] is not None
+        and summary['regular_price'] is not None
+        and summary['regular_price'] != summary['ozon_bank_price']
+    ):
+        lines.append(f"С другими банками: {_format_price(summary['regular_price'])}")
+
+    lines.append("")
+    previous_price = summary['previous_price']
+    change_amount = summary['change_amount']
+    if previous_price is None or change_amount is None:
+        lines.append("➖ Изменений пока нет")
+    else:
+        percent = (change_amount / previous_price) * 100 if previous_price else 0
+        arrow = "📈" if change_amount > 0 else ("🔻" if change_amount < 0 else "➖")
+        lines.append(
+            f"{arrow} {_format_signed(change_amount)} ₽ "
+            f"({_format_signed(percent, decimals=1)}%) с предыдущей проверки"
+        )
+
+    lines.append(f"Минимум: {_format_price(summary['min_price'])}")
+    return "\n".join(lines)
+
+
 def get_user_state(user_id: int) -> dict:
     return db.get_user_state(user_id)
 
@@ -130,7 +193,7 @@ async def _send_list_page(update, user_id, products, page, edit=True):
     stats_cache = {}
     threshold_cache = {}
     for pid in product_ids:
-        min_p, max_p = db.get_price_stats(pid)
+        min_p, max_p = db.get_user_price_stats(user_id, pid)
         stats_cache[pid] = (min_p, max_p)
         threshold_cache[pid] = db.get_user_product_threshold(user_id, pid)
 
@@ -264,41 +327,15 @@ async def handle_product_detail(update: Update, context: ContextTypes.DEFAULT_TY
         await edit_message_with_retry(query, "❌ Товар не найден.")
         return
 
-    # Формируем детали
-    name = product['product_name'] or f"Товар #{product['product_id']}"
-    regular_price = product['current_price']
-    bank_price = product['current_ozon_bank_price'] if 'current_ozon_bank_price' in product.keys() else None
-
-    if bank_price:
-        price_text = f"💰 *Цена с Ozon Банком:* {bank_price:,.0f} ₽"
-        if regular_price:
-            price_text += f"\n💰 *Обычная цена:* ~~{regular_price:,.0f}~~ ₽"
-    elif regular_price:
-        price_text = f"💰 *Цена:* {regular_price:,.0f} ₽"
-    else:
-        price_text = "💰 Цена: не определена"
-
-    # Последняя проверка
-    last_check = to_msk(product['last_checked']) if product['last_checked'] else "Никогда"
-
-    # Min/Max цены за всю историю
-    min_price, max_price = db.get_price_stats(product_id)
-    stats_text = ""
-    if min_price is not None and max_price is not None:
-        stats_text = f"\n📊 *Мин:* {min_price:,.0f} ₽  *Макс:* {max_price:,.0f} ₽"
-
     # Порог уведомления
     user_thresh = db.get_user_product_threshold(user_id, product_id)
     from bot import config
     eff_thresh = user_thresh if user_thresh is not None else config.price_change_threshold
-    thresh_text = f"\n🔔 *Порог уведомления:* {eff_thresh}%"
+    tracking_text = build_product_tracking_text(product, user_id)
 
     text = (
-        f"📦 *{name}*\n\n"
-        f"{price_text}\n"
-        f"🕐 *Последняя проверка:* {last_check}"
-        f"{stats_text}"
-        f"{thresh_text}\n"
+        f"{tracking_text}\n\n"
+        f"🔔 *Порог уведомления:* {eff_thresh}%\n"
         f"🔗 [Открыть товар]({product['ozon_url']})"
     )
 
@@ -344,39 +381,15 @@ async def show_product_detail(update, user_id, product_id):
             await edit_message_with_retry(query, "❌ Товар не найден.")
         return
 
-    name = product['product_name'] or f"Товар #{product['product_id']}"
-    regular_price = product['current_price']
-    bank_price = product['current_ozon_bank_price'] if 'current_ozon_bank_price' in product.keys() else None
-
-    if bank_price:
-        price_text = f"💰 *Цена с Ozon Банком:* {bank_price:,.0f} ₽"
-        if regular_price:
-            price_text += f"\n💰 *Обычная цена:* ~~{regular_price:,.0f}~~ ₽"
-    elif regular_price:
-        price_text = f"💰 *Цена:* {regular_price:,.0f} ₽"
-    else:
-        price_text = "💰 Цена: не определена"
-
-    last_check = to_msk(product['last_checked']) if product['last_checked'] else "Никогда"
-
-    # Min/Max цены за всю историю
-    min_price, max_price = db.get_price_stats(product_id)
-    stats_text = ""
-    if min_price is not None and max_price is not None:
-        stats_text = f"\n📊 *Мин:* {min_price:,.0f} ₽  *Макс:* {max_price:,.0f} ₽"
-
     # Порог уведомления
     user_thresh = db.get_user_product_threshold(user_id, product_id)
     from bot import config
     eff_thresh = user_thresh if user_thresh is not None else config.price_change_threshold
-    thresh_text = f"\n🔔 *Порог уведомления:* {eff_thresh}%"
+    tracking_text = build_product_tracking_text(product, user_id)
 
     text = (
-        f"📦 *{name}*\n\n"
-        f"{price_text}\n"
-        f"🕐 *Последняя проверка:* {last_check}"
-        f"{stats_text}"
-        f"{thresh_text}\n"
+        f"{tracking_text}\n\n"
+        f"🔔 *Порог уведомления:* {eff_thresh}%\n"
         f"🔗 [Открыть товар]({product['ozon_url']})"
     )
 
@@ -459,9 +472,9 @@ async def handle_detail_history(update: Update, context: ContextTypes.DEFAULT_TY
         await edit_message_with_retry(query, "❌ Товар не найден.")
         return
 
-    price_changes = db.get_price_changes(product_id, limit=15)
-    full_history = db.get_price_history(product_id, limit=None, ascending=True)
-    min_price, max_price = db.get_price_stats(product_id)
+    price_changes = db.get_user_price_changes(user_id, product_id, limit=15)
+    full_history = db.get_user_price_history(user_id, product_id, limit=None, ascending=True)
+    min_price, max_price = db.get_user_price_stats(user_id, product_id)
     name = product['product_name'] or f"Товар #{product_id}"
 
     # Заголовок с min/max
@@ -476,7 +489,8 @@ async def handle_detail_history(update: Update, context: ContextTypes.DEFAULT_TY
         await edit_message_with_retry(query, text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True)
         return
 
-    latest_price = full_history[-1]["price"] if full_history else None
+    summary = db.get_user_price_summary(user_id, product_id)
+    latest_price = summary['current_price'] if summary else None
     caption = f"📈 *История цены: {name}*"
     if latest_price is not None:
         caption += f"\n💰 *Текущая:* {latest_price:,.0f} ₽"
@@ -528,34 +542,17 @@ async def handle_detail_check(update: Update, context: ContextTypes.DEFAULT_TYPE
     product_name, regular_price, ozon_bank_price, request_ok = await get_ozon_price(product['ozon_url'])
     
 
-    if ozon_bank_price is None and regular_price is None and request_ok:
-        text = f"❌ Не удалось получить цену."
+    if not request_ok:
+        text = "❌ Ошибка сети. Не удалось связаться с Ozon."
+    elif ozon_bank_price is None and regular_price is None:
+        text = "❌ Не удалось получить цену."
     else:
-        new_price = ozon_bank_price or regular_price
-        old_regular = product['current_price']
-        old_bank = product['current_ozon_bank_price'] if 'current_ozon_bank_price' in product.keys() else None
-        old_price = old_bank or old_regular
-
         db.update_product_price(product_id, regular_price, ozon_bank_price, product_name)
-
-        name = product_name or product['product_name'] or f"Товар #{product_id}"
-        price_detail = f"*{new_price:,.0f} ₽*"
-        if ozon_bank_price and regular_price and ozon_bank_price < regular_price:
-            price_detail += f"\nОбычная: {regular_price:,.0f} ₽"
-        elif regular_price:
-            price_detail += f"\nОбычная: {regular_price:,.0f} ₽"
-
-        if old_price and new_price:
-            diff = new_price - old_price
-            percent = (diff / old_price) * 100
-            arrow = "📉" if diff < 0 else ("📈" if diff > 0 else "➡️")
-            text = (
-                f"{arrow} *{name}*\n\n"
-                f"💰 Цена: {price_detail}\n"
-                f"Изменение: {'+' if diff > 0 else ''}{diff:,.0f} ₽ ({'+' if percent > 0 else ''}{percent:.1f}%)"
-            )
-        else:
-            text = f"✅ *{name}*\n\n💰 Цена: {price_detail}"
+        refreshed_product = next(
+            (item for item in db.get_user_products(user_id) if item['product_id'] == product_id),
+            product,
+        )
+        text = build_product_tracking_text(refreshed_product, user_id)
 
     # Кнопка "Назад к товару"
     keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data=f"list_prod:{product_id}")]]

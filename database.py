@@ -80,6 +80,8 @@ def init_db():
             user_id INTEGER NOT NULL,
             product_id INTEGER NOT NULL,
             price_threshold REAL,
+            start_price REAL,
+            last_notified_price REAL,
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (user_id, product_id),
             FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
@@ -90,6 +92,16 @@ def init_db():
     # Миграция: добавляем price_threshold если нет
     try:
         cursor.execute('ALTER TABLE user_products ADD COLUMN price_threshold REAL')
+    except Exception:
+        pass
+
+    try:
+        cursor.execute('ALTER TABLE user_products ADD COLUMN start_price REAL')
+    except Exception:
+        pass
+
+    try:
+        cursor.execute('ALTER TABLE user_products ADD COLUMN last_notified_price REAL')
     except Exception:
         pass
 
@@ -104,6 +116,39 @@ def init_db():
             checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (product_id) REFERENCES products(product_id)
         )
+    ''')
+
+    # Best-effort migration for subscriptions created before start_price existed.
+    cursor.execute('''
+        UPDATE user_products
+        SET start_price = COALESCE(
+            (
+                SELECT COALESCE(ph.old_price, ph.price)
+                FROM price_history ph
+                WHERE ph.product_id = user_products.product_id
+                  AND ph.checked_at >= user_products.added_at
+                ORDER BY ph.checked_at ASC, ph.history_id ASC
+                LIMIT 1
+            ),
+            (
+                SELECT COALESCE(p.current_ozon_bank_price, p.current_price)
+                FROM products p
+                WHERE p.product_id = user_products.product_id
+            )
+        )
+        WHERE start_price IS NULL
+    ''')
+
+    cursor.execute('''
+        UPDATE user_products
+        SET last_notified_price = start_price
+        WHERE last_notified_price IS NULL AND start_price IS NOT NULL
+    ''')
+
+    # price_history is an event log: keep changes, not initial/duplicate snapshots.
+    cursor.execute('''
+        DELETE FROM price_history
+        WHERE old_price IS NULL OR price = old_price
     ''')
 
     # Таблица состояний пользователей (FSM)
@@ -286,7 +331,7 @@ def get_user_products(user_id):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT p.*, up.added_at
+        SELECT p.*, up.added_at, up.start_price, up.last_notified_price
         FROM products p
         JOIN user_products up ON p.product_id = up.product_id
         WHERE up.user_id = ? AND p.is_active = 1
@@ -351,8 +396,8 @@ def update_product_price(product_id, new_price, ozon_bank_price=None, product_na
     old_price = row['current_price'] if row else None
     old_ozon_bank_price = row['current_ozon_bank_price'] if row else None
 
-    effective_old = old_ozon_bank_price or old_price
-    effective_new = ozon_bank_price or new_price
+    effective_old = old_ozon_bank_price if old_ozon_bank_price is not None else old_price
+    effective_new = ozon_bank_price if ozon_bank_price is not None else new_price
 
     next_check = calculate_next_check(check_interval)
 
@@ -361,14 +406,14 @@ def update_product_price(product_id, new_price, ozon_bank_price=None, product_na
         SET previous_price = current_price,
             previous_ozon_bank_price = current_ozon_bank_price,
             current_price = ?,
-            current_ozon_bank_price = COALESCE(?, current_ozon_bank_price),
+            current_ozon_bank_price = ?,
             product_name = COALESCE(?, product_name),
             last_checked = CURRENT_TIMESTAMP,
             next_check = ?
         WHERE product_id = ?
     ''', (new_price, ozon_bank_price, product_name, next_check, product_id))
 
-    if effective_new is not None:
+    if effective_old is not None and effective_new is not None and effective_new != effective_old:
         cursor.execute('''
             INSERT INTO price_history (product_id, price, old_price)
             VALUES (?, ?, ?)
@@ -378,6 +423,41 @@ def update_product_price(product_id, new_price, ozon_bank_price=None, product_na
     conn.close()
 
     return old_price, new_price, old_ozon_bank_price, ozon_bank_price
+
+
+def set_user_product_start_price(user_id, product_id, start_price):
+    """Зафиксировать стартовую цену новой подписки ровно один раз."""
+    if start_price is None:
+        return False
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE user_products
+        SET start_price = ?,
+            last_notified_price = COALESCE(last_notified_price, ?),
+            added_at = CURRENT_TIMESTAMP
+        WHERE user_id = ? AND product_id = ? AND start_price IS NULL
+    ''', (start_price, start_price, user_id, product_id))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def set_last_notified_price(user_id, product_id, price):
+    """Обновить опорную цену после успешно отправленного уведомления."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE user_products
+        SET last_notified_price = ?
+        WHERE user_id = ? AND product_id = ?
+    ''', (price, user_id, product_id))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
 
 
 def update_product_availability(product_id, is_available, check_interval=3600):
@@ -437,7 +517,8 @@ def get_user_product_for_notification(product_id):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT p.*, u.user_id, u.username, u.first_name, up.price_threshold
+        SELECT p.*, u.user_id, u.username, u.first_name,
+               up.price_threshold, up.last_notified_price
         FROM products p
         JOIN user_products up ON p.product_id = up.product_id
         JOIN users u ON u.user_id = up.user_id
@@ -551,6 +632,144 @@ def get_price_stats(product_id):
     if row:
         return row['min_price'], row['max_price']
     return None, None
+
+
+def get_user_price_history(user_id, product_id, limit=None, ascending=True):
+    """История изменений товара после начала подписки плюс стартовая точка."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT start_price, added_at
+        FROM user_products
+        WHERE user_id = ? AND product_id = ?
+    ''', (user_id, product_id))
+    subscription = cursor.fetchone()
+    if not subscription:
+        conn.close()
+        return []
+
+    cursor.execute('''
+        SELECT ph.*
+        FROM price_history ph
+        WHERE ph.product_id = ?
+          AND ph.checked_at > ?
+          AND ph.old_price IS NOT NULL
+          AND ph.price != ph.old_price
+        ORDER BY ph.checked_at ASC, ph.history_id ASC
+    ''', (product_id, subscription['added_at']))
+    history = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    if subscription['start_price'] is not None:
+        history.insert(0, {
+            'history_id': None,
+            'product_id': product_id,
+            'price': subscription['start_price'],
+            'old_price': None,
+            'checked_at': subscription['added_at'],
+        })
+
+    if not ascending:
+        history.reverse()
+    if limit is not None:
+        history = history[:limit]
+    return history
+
+
+def get_user_price_changes(user_id, product_id, limit=10):
+    """Получить реальные изменения цены в периоде подписки пользователя."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT ph.*
+        FROM price_history ph
+        JOIN user_products up ON up.product_id = ph.product_id
+        WHERE up.user_id = ?
+          AND ph.product_id = ?
+          AND ph.checked_at > up.added_at
+          AND ph.old_price IS NOT NULL
+          AND ph.price != ph.old_price
+        ORDER BY ph.checked_at DESC, ph.history_id DESC
+        LIMIT ?
+    ''', (user_id, product_id, limit))
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+
+def get_user_price_summary(user_id, product_id):
+    """Сводка эффективной цены в границах подписки пользователя."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT
+            up.start_price,
+            up.added_at,
+            COALESCE(p.current_ozon_bank_price, p.current_price) AS current_price,
+            p.current_price AS regular_price,
+            p.current_ozon_bank_price AS ozon_bank_price,
+            p.last_checked
+        FROM user_products up
+        JOIN products p ON p.product_id = up.product_id
+        WHERE up.user_id = ? AND up.product_id = ?
+    ''', (user_id, product_id))
+    subscription = cursor.fetchone()
+    if not subscription:
+        conn.close()
+        return None
+
+    cursor.execute('''
+        SELECT ph.price, ph.old_price, ph.checked_at
+        FROM price_history ph
+        WHERE ph.product_id = ?
+          AND ph.checked_at > ?
+          AND ph.old_price IS NOT NULL
+          AND ph.price != ph.old_price
+        ORDER BY ph.checked_at DESC, ph.history_id DESC
+        LIMIT 1
+    ''', (product_id, subscription['added_at']))
+    latest_change = cursor.fetchone()
+
+    cursor.execute('''
+        SELECT MIN(price) AS min_price, MAX(price) AS max_price
+        FROM price_history
+        WHERE product_id = ?
+          AND checked_at > ?
+          AND old_price IS NOT NULL
+          AND price != old_price
+    ''', (product_id, subscription['added_at']))
+    stats = cursor.fetchone()
+    conn.close()
+
+    start_price = subscription['start_price']
+    current_price = subscription['current_price']
+    period_prices = [price for price in (start_price, stats['min_price']) if price is not None]
+    period_max_prices = [price for price in (start_price, stats['max_price']) if price is not None]
+    previous_price = latest_change['old_price'] if latest_change else None
+
+    return {
+        'start_price': start_price,
+        'started_at': subscription['added_at'],
+        'current_price': current_price,
+        'regular_price': subscription['regular_price'],
+        'ozon_bank_price': subscription['ozon_bank_price'],
+        'last_checked': subscription['last_checked'],
+        'previous_price': previous_price,
+        'change_amount': (
+            current_price - previous_price
+            if current_price is not None and previous_price is not None
+            else None
+        ),
+        'min_price': min(period_prices) if period_prices else None,
+        'max_price': max(period_max_prices) if period_max_prices else None,
+    }
+
+
+def get_user_price_stats(user_id, product_id):
+    summary = get_user_price_summary(user_id, product_id)
+    if not summary:
+        return None, None
+    return summary['min_price'], summary['max_price']
 
 
 # === Операции с состояниями пользователей (FSM) ===

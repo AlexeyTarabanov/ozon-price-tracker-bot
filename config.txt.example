@@ -10,13 +10,13 @@ CHECK_INTERVAL=1800
 
 # Minimum price change percentage to trigger notification
 # Default: 1 (notify on >= 1% change)
-PRICE_CHANGE_THRESHOLD=1
+PRICE_CHANGE_THRESHOLD=3
 
 # Notification direction: both, down, up
 # both - notify on any change
 # down - notify only on price decrease
 # up - notify only on price increase
-NOTIFICATION_DIRECTION=both
+NOTIFICATION_DIRECTION=down
 
 # Use test cookie method before Playwright fallback
 # true  - first try Selenium cookies, then fallback to Playwright

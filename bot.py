@@ -91,7 +91,13 @@ import database as db
 from ozon_client import get_ozon_price
 from price_checker import extract_product_id, is_valid_sku, sku_to_url, resolve_short_url
 from cart_parser import get_cart_products, extract_share_code
-from list_handler import add_list_handlers, list_products_paginated, show_product_detail, STATE_THRESHOLD_ASK
+from list_handler import (
+    STATE_THRESHOLD_ASK,
+    add_list_handlers,
+    build_product_tracking_text,
+    list_products_paginated,
+    show_product_detail,
+)
 
 # Настройка логирования
 import logging.handlers
@@ -110,7 +116,13 @@ logging.basicConfig(
         logging.StreamHandler(),  # Консольный вывод
     ],
 )
+
 logger = logging.getLogger(__name__)
+
+# Не логируем полные HTTP URL.
+# Telegram Bot API содержит токен прямо в URL.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # Rate limit для /checkall (user_id -> время последнего вызова)
 _checkall_cooldowns: dict[int, datetime] = {}
@@ -153,51 +165,20 @@ async def notify_price_change_subscribers(
     bot,
     product: dict,
     product_name: Optional[str],
-    old_price: Optional[float],
     new_regular: Optional[float],
     new_bank: Optional[float],
     *,
     skip_user_id: Optional[int] = None,
 ) -> int:
-    """Отправить уведомления всем подписчикам товара с учётом их порогов."""
-    new_price = new_bank or new_regular
-    if not old_price or new_price is None:
+    """Уведомить о достаточном снижении от последней уведомлённой цены."""
+    new_price = new_bank if new_bank is not None else new_regular
+    if new_price is None:
         return 0
 
-    diff = new_price - old_price
-    if old_price == 0:
-        return 0
-
-    percent = (diff / old_price) * 100
-    changed = abs(percent) >= config.price_change_threshold
-    if not changed:
-        return 0
-
-    should_notify = False
-    if config.notification_direction == 'both':
-        should_notify = True
-    elif config.notification_direction == 'down' and diff < 0:
-        should_notify = True
-    elif config.notification_direction == 'up' and diff > 0:
-        should_notify = True
-
-    if not should_notify:
-        return 0
-
-    arrow = "📉" if diff < 0 else "📈"
     name = product_name or product['product_name'] or f"Товар #{product['product_id']}"
     price_detail = f"{new_price:,.0f} ₽"
     if new_bank and new_regular and new_bank < new_regular:
         price_detail += f" (обычная: {new_regular:,.0f} ₽)"
-
-    message = (
-        f"{arrow} *Цена изменилась!*\n\n"
-        f"*{name}*\n"
-        f"Было: {old_price:,.0f} ₽\n"
-        f"Стало: {price_detail}\n"
-        f"Изменение: {'+' if diff > 0 else ''}{diff:,.0f} ₽ ({'+' if percent > 0 else ''}{percent:.1f}%)\n\n"
-        f"🔗 [Открыть товар]({product['ozon_url']})"
-    )
     reply_markup = build_history_price_keyboard(product['product_id'])
 
     notifications = 0
@@ -206,11 +187,28 @@ async def notify_price_change_subscribers(
         if skip_user_id is not None and entry['user_id'] == skip_user_id:
             continue
 
-        user_threshold = entry['price_threshold'] if 'price_threshold' in entry.keys() else None
-        effective_threshold = user_threshold if user_threshold is not None else config.price_change_threshold
-        if abs(percent) < effective_threshold:
+        last_notified_price = entry['last_notified_price']
+        if last_notified_price is None or last_notified_price <= 0:
+            db.set_last_notified_price(entry['user_id'], product['product_id'], new_price)
+            continue
+        if new_price >= last_notified_price:
             continue
 
+        decrease = last_notified_price - new_price
+        decrease_percent = (decrease / last_notified_price) * 100
+        user_threshold = entry['price_threshold'] if 'price_threshold' in entry.keys() else None
+        effective_threshold = user_threshold if user_threshold is not None else config.price_change_threshold
+        if decrease_percent < effective_threshold:
+            continue
+
+        message = (
+            f"🔻 *Цена снизилась!*\n\n"
+            f"*{name}*\n"
+            f"Было: {last_notified_price:,.0f} ₽\n"
+            f"Стало: {price_detail}\n"
+            f"Снижение: −{decrease:,.0f} ₽ (−{decrease_percent:.1f}%)\n\n"
+            f"🔗 [Открыть товар]({product['ozon_url']})"
+        )
         try:
             await send_message_with_retry(
                 bot,
@@ -220,6 +218,7 @@ async def notify_price_change_subscribers(
                 disable_web_page_preview=True,
                 reply_markup=reply_markup,
             )
+            db.set_last_notified_price(entry['user_id'], product['product_id'], new_price)
             notifications += 1
             logger.info(
                 f"Уведомление отправлено пользователю {entry['user_id']} "
@@ -351,8 +350,8 @@ class BotConfig:
     
     def __init__(self):
         self.check_interval = 3600
-        self.price_change_threshold = 1.0
-        self.notification_direction = 'both'  # both, down, up
+        self.price_change_threshold = 3.0
+        self.notification_direction = 'down'
         self.use_test_cookie_method = True
         self.bot_token = ''
         self.proxy_type = 'none'  # none, socks5, https
@@ -580,7 +579,7 @@ async def _process_add(update: Update, user_id: int, url: str):
     product_name, regular_price, ozon_bank_price, request_ok = await get_ozon_price(url)
 
     # Используем цену Ozon Банка если есть, иначе обычную
-    display_price = ozon_bank_price or regular_price
+    display_price = ozon_bank_price if ozon_bank_price is not None else regular_price
 
     if not request_ok:
         await edit_message_with_retry(status_msg,
@@ -599,6 +598,8 @@ async def _process_add(update: Update, user_id: int, url: str):
 
     # Обновляем цену в БД (используем результат первого запроса)
     db.update_product_price(db_product_id, regular_price, ozon_bank_price, product_name, config.check_interval)
+    if is_new:
+        db.set_user_product_start_price(user_id, db_product_id, display_price)
 
     # Если товар уже отслеживался — сообщаем об этом, но показываем актуальную цену
     if not is_new:
@@ -842,8 +843,8 @@ async def handle_history_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     product = products[product_number - 1]
-    price_history = db.get_price_history(product['product_id'], limit=10)
-    full_history = db.get_price_history(product['product_id'], limit=None, ascending=True)
+    price_history = db.get_user_price_history(user_id, product['product_id'], limit=10, ascending=False)
+    full_history = db.get_user_price_history(user_id, product['product_id'], limit=None, ascending=True)
 
     if not price_history:
         await reply_text_with_retry(update.message, "📭 История цен пока пуста.")
@@ -851,8 +852,9 @@ async def handle_history_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     name = product['product_name'] or f"Товар #{product['product_id']}"
-    min_price, max_price = db.get_price_stats(product['product_id'])
-    latest_price = price_history[0]['price'] if price_history else None
+    min_price, max_price = db.get_user_price_stats(user_id, product['product_id'])
+    summary = db.get_user_price_summary(user_id, product['product_id'])
+    latest_price = summary['current_price'] if summary else None
     caption = f"📈 *График цены: {name}*\n🔗 [Открыть товар]({product['ozon_url']})"
     if latest_price is not None:
         caption += f"\n💰 *Текущая:* {latest_price:,.0f} ₽"
@@ -951,65 +953,25 @@ async def handle_check_step(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     db.update_product_price(product['product_id'], new_regular, new_bank, product_name, config.check_interval)
 
-    name = product_name or product['product_name'] or f"Товар #{product['product_id']}"
-    sent_notifications = 0
+    sent_notifications = await notify_price_change_subscribers(
+        context.bot,
+        product,
+        product_name,
+        new_regular,
+        new_bank,
+        skip_user_id=user_id,
+    )
+    reply_markup = (
+        build_history_price_keyboard(product['product_id'])
+        if old_price is not None and new_price != old_price
+        else None
+    )
 
-    if old_price and new_price:
-        diff = new_price - old_price
-        percent = (diff / old_price) * 100
-        changed = abs(percent) >= config.price_change_threshold
-
-        if changed:
-            arrow = "📉" if diff < 0 else "📈"
-            price_details = f"*{new_price:,.0f} ₽*"
-            if new_bank and new_regular and new_bank < new_regular:
-                price_details += f" (обычная: {new_regular:,.0f} ₽)"
-            elif new_regular:
-                price_details += f" (обычная: {new_regular:,.0f} ₽)"
-
-            message = (
-                f"{arrow} *Цена изменилась!*\n\n"
-                f"*{name}*\n"
-                f"Было: {old_price:,.0f} ₽\n"
-                f"Стало: {price_details}\n"
-                f"Изменение: {'+' if diff > 0 else ''}{diff:,.0f} ₽ ({'+' if percent > 0 else ''}{percent:.1f}%)\n\n"
-                f"🔗 [Открыть товар]({product['ozon_url']})"
-            )
-            reply_markup = build_history_price_keyboard(product['product_id'])
-            sent_notifications = await notify_price_change_subscribers(
-                context.bot,
-                product,
-                product_name,
-                old_price,
-                new_regular,
-                new_bank,
-                skip_user_id=user_id,
-            )
-        else:
-            price_details = f"*{new_price:,.0f} ₽*"
-            if new_bank and new_regular and new_bank < new_regular:
-                price_details += f" (обычная: {new_regular:,.0f} ₽)"
-
-            message = (
-                f"✅ *Цена не изменилась*\n\n"
-                f"*{name}*\n"
-                f"Цена: {price_details}\n\n"
-                f"🔗 [Открыть товар]({product['ozon_url']})"
-            )
-            reply_markup = None
-    else:
-        price_details = f"*{new_price:,.0f} ₽*"
-        if new_bank and new_regular and new_bank < new_regular:
-            price_details += f" (обычная: {new_regular:,.0f} ₽)"
-
-        message = (
-            f"✅ *Цена получена*\n\n"
-            f"*{name}*\n"
-            f"Цена: {price_details}\n\n"
-            f"🔗 [Открыть товар]({product['ozon_url']})"
-        )
-        reply_markup = None
-
+    refreshed_product = next(
+        (item for item in db.get_user_products(user_id) if item['product_id'] == product['product_id']),
+        product,
+    )
+    message = build_product_tracking_text(refreshed_product, user_id)
     db.clear_user_state(user_id)
     if sent_notifications > 0:
         message += f"\n\n🔔 Другим подписчикам отправлено уведомлений: {sent_notifications}"
@@ -1205,6 +1167,11 @@ async def _add_cart_products(update, user_id, share_code, status_msg):
             if regular_price or ozon_bank_price:
                 db.update_product_price(
                     product_id, regular_price, ozon_bank_price, name, config.check_interval
+                )
+                db.set_user_product_start_price(
+                    user_id,
+                    product_id,
+                    ozon_bank_price if ozon_bank_price is not None else regular_price,
                 )
             added += 1
 
@@ -1561,7 +1528,6 @@ async def price_check_job(context: ContextTypes.DEFAULT_TYPE):
                 context.bot,
                 product,
                 product_name,
-                old_price,
                 new_regular,
                 new_bank,
             )
