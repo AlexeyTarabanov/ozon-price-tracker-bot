@@ -35,6 +35,7 @@ cookies.json
 cart_items.json
 browser_data/
 .ozon-browser-profile/
+.playwright-browsers/
 
 # Local debug artifacts
 test_cookies_selenium

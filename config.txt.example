@@ -21,7 +21,7 @@ NOTIFICATION_DIRECTION=down
 # Use test cookie method before Playwright fallback
 # true  - first try Selenium cookies, then fallback to Playwright
 # false - use only Playwright browser emulation
-USE_TEST_COOKIE_METHOD=true
+USE_TEST_COOKIE_METHOD=false
 
 # Proxy settings for Telegram connection
 # Supported values for Telegram transport: none, socks5h, https

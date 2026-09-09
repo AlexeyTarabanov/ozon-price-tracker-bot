@@ -102,7 +102,7 @@ BOT_TOKEN=
 CHECK_INTERVAL=1800
 PRICE_CHANGE_THRESHOLD=3
 NOTIFICATION_DIRECTION=down
-USE_TEST_COOKIE_METHOD=true
+USE_TEST_COOKIE_METHOD=false
 PROXY_TYPE=none
 PROXY_URL=
 ADMIN_ID=
@@ -197,6 +197,30 @@ pip install -r requirements.txt
 ```bash
 playwright install chromium
 ```
+
+## Ubuntu VPS
+
+На сервере бот запускается из Python venv под отдельным пользователем. Текущий
+headed Chromium работает через Xvfb, а persistent browser profile хранится на
+диске между запусками.
+
+Основные пути:
+
+- проект: `/opt/ozon-price-tracker-bot`;
+- SQLite: `/opt/ozon-price-tracker-bot/ozon_tracker.db`;
+- browser profile: `/opt/ozon-price-tracker-bot/.ozon-browser-profile`;
+- Playwright browsers: `/opt/ozon-price-tracker-bot/.playwright-browsers`.
+
+Установка системных зависимостей и Chromium:
+
+```bash
+sudo apt-get install python3-venv xvfb
+sudo /opt/ozon-price-tracker-bot/.venv/bin/playwright install-deps chromium
+sudo -u ozonbot env PLAYWRIGHT_BROWSERS_PATH=/opt/ozon-price-tracker-bot/.playwright-browsers \
+  /opt/ozon-price-tracker-bot/.venv/bin/playwright install chromium
+```
+
+Systemd unit находится в `deploy/ozon-price-tracker-bot.service`.
 
 ## Замечания
 
